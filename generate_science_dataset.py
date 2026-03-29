@@ -12,35 +12,38 @@ from dataclasses import dataclass
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import aiofiles
-from tqdm.asyncio import tqdm
 
 # ========================== HYPER-DETAILED CONFIGURATION ==========================
 @dataclass
 class Config:
-    model_name: str = "Qwen/Qwen2.5-7B-Instruct"  # Strong for math/proofs; 4-bit fits \~6-8GB VRAM on self-hosted GPU
+    model_name: str = "HuggingFaceTB/SmolLM3-3B-Instruct"  # Strong small model for math/reasoning (2026)
     load_in_4bit: bool = True
-    max_new_tokens: int = 2800
+    max_new_tokens: int = 1800
     temperature: float = 0.55
     top_p: float = 0.92
-    target_samples: int = 100000          # Strict target - will run until reached
-    max_concurrent: int = 2               # Low for stability on typical self-hosted GPU (increase if more VRAM)
-    retries: int = 4
-    backoff_factor: float = 1.7
+    batch_samples: int = 800               # Safe per-run batch for 6h timeout on ubuntu-latest
+    target_total: int = 100000
+    max_concurrent: int = 1                # CPU-only safety
+    retries: int = 5
+    backoff_factor: float = 1.6
     data_dir: Path = Path("dataset_output")
     output_file: Optional[Path] = None
+    progress_file: Path = Path("dataset_output/current_count.txt")
 
     def __post_init__(self):
         self.data_dir.mkdir(exist_ok=True, parents=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.output_file = self.data_dir / f"science_heavy_local_{timestamp}.jsonl"
+        self.output_file = self.data_dir / f"science_heavy_cpu_{timestamp}.jsonl"
+        
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s | %(levelname)-8s | %(message)s',
             handlers=[
                 logging.FileHandler(self.data_dir / f"run_log_{timestamp}.log", encoding="utf-8"),
-                logging.StreamHandler()  # Real-time console streaming
+                logging.StreamHandler()   # Real-time streaming in GitHub Actions logs
             ]
         )
+        logging.info(f"Starting batch generation. Model: {self.model_name} | Batch size: {self.batch_samples} | Overall target: {self.target_total}")
 
 config = Config()
 
@@ -64,37 +67,42 @@ STEM_TOPICS_STARTERS: List[str] = [
 ]
 
 def expand_topic_seed(seed: str) -> List[str]:
-    prefixes = ["derive", "prove", "explain the detailed mechanism of", "derive rigorously from first principles",
-                "show using multiple approaches", "derive thermodynamically", "solve the differential equation for",
-                "prove using contradiction and direct method", "explain quantum mechanically"]
+    prefixes = [
+        "derive", "prove", "explain the detailed mechanism of",
+        "derive rigorously from first principles", "show using multiple approaches",
+        "derive thermodynamically", "solve the differential equation for",
+        "prove using contradiction and direct method", "explain quantum mechanically"
+    ]
     variants = [f"{p} {seed}" for p in prefixes]
     depth_variants = [
         f"{seed} including limiting cases, dimensional analysis, and physical intuition",
-        f"{seed} with historical context, original sources, and modern applications",
+        f"{seed} with historical context, sources, and modern applications",
         f"advanced graduate-level derivation and extensions of {seed}",
-        f"{seed} using Lagrangian formalism where applicable",
         f"{seed} with error analysis, common misconceptions, and micro-verifications",
     ]
     expanded = list(set(variants + depth_variants))
     random.shuffle(expanded)
     return expanded[:10]
 
-SYSTEM_PROMPT = """You are an expert scientific reasoner. Output ONLY in this EXACT strict format — nothing else. Use heavy LaTeX. Be hyper-detailed, multi-angle, rigorous. Zero hallucinations.
+SYSTEM_PROMPT = """You are an expert scientific reasoner. Output ONLY in this EXACT strict format — nothing before or after. Use heavy LaTeX for equations. Be hyper-detailed, multi-angle, rigorous. Zero hallucinations.
 
 ### [DECOMPOSITION]
-Numbered hierarchical breakdown.
+Numbered hierarchical breakdown into atomic subproblems.
 
 ### [AXIOMS & PROVENANCE]
-Bullet list of laws, constants, sources.
+Bullet list of laws, constants, sources (textbooks/papers/years).
 
 ### [NESTED REASONING]
 **Step 1: Title**
-Detailed paragraphs + equations.
+Detailed paragraph(s) + equations.
 
-**Step 2: ...** (continue deeply)
+**Step 2: ...**
+Deeper detail, alternatives, cross-checks, edge cases.
+
+Continue deeply...
 
 ### [MICRO-VERIFICATION]
-- Dimensional check ✓
+- Dimensional/units check ✓
 - Limiting case ✓
 - Known value match ✓
 - Logical consistency ✓
@@ -106,10 +114,10 @@ Concise \\boxed{result} + 1-sentence summary.
 
 # ========================== MODEL LOADING ==========================
 def load_model():
-    logging.info(f"Loading local model: {config.model_name} (4-bit quantized for GitHub self-hosted GPU)")
+    logging.info("Loading SmolLM3-3B-Instruct (4-bit quantized for CPU).")
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4"
     ) if config.load_in_4bit else None
@@ -121,8 +129,8 @@ def load_model():
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         quantization_config=quant_config,
-        device_map="auto",
-        torch_dtype="auto",
+        device_map="cpu",          # Force CPU for hosted runner
+        torch_dtype=torch.float16,
         trust_remote_code=True,
         low_cpu_mem_usage=True
     )
@@ -131,7 +139,7 @@ def load_model():
 
 # ========================== GENERATION ==========================
 async def generate_one(model, tokenizer, instruction: str) -> Optional[Dict[str, Any]]:
-    user_msg = f"Instruction: {instruction}\n\nFollow the format exactly. Make it much longer and more rigorous than textbook examples."
+    user_msg = f"Instruction: {instruction}\n\nFollow the format exactly. Make it longer, more detailed, and more rigorous than typical textbook solutions. Include edge cases and verifications."
     full_prompt = f"{SYSTEM_PROMPT}\n\n{user_msg}"
 
     inputs = tokenizer(full_prompt, return_tensors="pt").to(model.device)
@@ -151,21 +159,21 @@ async def generate_one(model, tokenizer, instruction: str) -> Optional[Dict[str,
             content = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
 
             if not content.startswith("### [DECOMPOSITION]") or "### [FINAL ANSWER]" not in content or "\\boxed" not in content:
-                raise ValueError("Invalid strict format")
+                raise ValueError("Strict format violation")
 
             result = {"instruction": instruction, "input": "", "output": content}
-            logging.info(f"SUCCESS [{attempt+1}] {instruction[:80]}...")  # Streamed real-time output
+            logging.info(f"SUCCESS: {instruction[:75]}...")
             return result
         except Exception as e:
             if attempt == config.retries - 1:
-                logging.warning(f"Failed after retries: {instruction[:100]} | {e}")
+                logging.warning(f"Failed after {config.retries} attempts: {instruction[:100]}")
                 return None
             await asyncio.sleep(config.backoff_factor ** attempt * 1.2)
 
     return None
 
-# ========================== WORKERS & TOPIC GENERATOR ==========================
-async def worker(model, tokenizer, queue: asyncio.Queue, counter: list, lock: asyncio.Lock):
+# ========================== WORKER & TOPIC GENERATOR ==========================
+async def worker(model, tokenizer, queue: asyncio.Queue, counter: list, lock: asyncio.Lock, total_generated: int):
     while True:
         try:
             instr = await queue.get()
@@ -176,16 +184,18 @@ async def worker(model, tokenizer, queue: asyncio.Queue, counter: list, lock: as
 
         async with lock:
             counter[0] += 1
+            current_total = total_generated + counter[0]
             if result and config.output_file:
                 async with aiofiles.open(config.output_file, "a", encoding="utf-8") as f:
                     await f.write(json.dumps(result, ensure_ascii=False) + "\n")
-            print(f"[{counter[0]:6d}/{config.target_samples}] Generated → {instr[:70]}...")  # Real-time console stream
+            print(f"[{current_total:6d}/{config.target_total}] Generated → {instr[:68]}...")  # Real-time stream
 
         queue.task_done()
 
-async def topic_generator(seed_queue: deque, instr_queue: asyncio.Queue):
+async def topic_generator(seed_queue: deque, instr_queue: asyncio.Queue, max_to_generate: int):
     seen = set()
-    while len(seen) < config.target_samples * 1.4:  # Oversample to guarantee 100k valid
+    generated_count = 0
+    while generated_count < max_to_generate and len(seen) < max_to_generate * 1.5:
         if not seed_queue:
             break
         current = seed_queue.popleft()
@@ -193,28 +203,37 @@ async def topic_generator(seed_queue: deque, instr_queue: asyncio.Queue):
             continue
         seen.add(current)
         for v in expand_topic_seed(current):
-            if v not in seen:
+            if v not in seen and generated_count < max_to_generate:
                 await instr_queue.put(v)
                 seen.add(v)
                 seed_queue.append(v)
-        if random.random() < 0.12:
-            seed_queue.extend(random.sample(STEM_TOPICS_STARTERS, k=3))
+                generated_count += 1
+        if random.random() < 0.13:
+            seed_queue.extend(random.sample(STEM_TOPICS_STARTERS, k=2))
 
 # ========================== MAIN ==========================
 async def main():
-    logging.info("=== Starting 100k Science-Heavy Dataset Generation (Local HF) ===")
-    logging.info(f"Output streaming to: {config.output_file}")
+    logging.info("=== Science-Heavy Dataset Generation Started (GitHub-hosted CPU) ===")
+    
+    # Load current progress
+    total_generated = 0
+    if config.progress_file.exists():
+        try:
+            total_generated = int(config.progress_file.read_text().strip())
+        except:
+            total_generated = 0
+    logging.info(f"Previous total: {total_generated} | Generating up to {config.batch_samples} more this run.")
 
     model, tokenizer = load_model()
 
     topic_q = deque(STEM_TOPICS_STARTERS)
-    instr_q: asyncio.Queue = asyncio.Queue(maxsize=20)
+    instr_q: asyncio.Queue = asyncio.Queue(maxsize=10)
 
-    producer = asyncio.create_task(topic_generator(topic_q, instr_q))
+    producer = asyncio.create_task(topic_generator(topic_q, instr_q, config.batch_samples))
 
-    total_counter = [0]
+    batch_counter = [0]
     lock = asyncio.Lock()
-    workers = [asyncio.create_task(worker(model, tokenizer, instr_q, total_counter, lock))
+    workers = [asyncio.create_task(worker(model, tokenizer, instr_q, batch_counter, lock, total_generated))
                for _ in range(config.max_concurrent)]
 
     await producer
@@ -223,11 +242,16 @@ async def main():
     for w in workers:
         w.cancel()
 
-    logging.info(f"\n=== FINISHED === Total samples: {total_counter[0]} (target 100k reached)")
-    logging.info(f"Final dataset: {config.output_file.resolve()}")
+    new_total = total_generated + batch_counter[0]
+    config.progress_file.write_text(str(new_total))
+
+    logging.info(f"=== Batch finished. New total: {new_total}/{config.target_total} ===")
+    logging.info(f"Dataset appended to: {config.output_file}")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Stopped by user. Partial dataset saved.")
+        logging.info("Stopped. Partial batch saved.")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
