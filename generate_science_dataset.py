@@ -16,7 +16,7 @@ import aiofiles
 # ========================== HYPER-DETAILED CONFIGURATION ==========================
 @dataclass
 class Config:
-    model_name: str = "HuggingFaceTB/SmolLM3-3B-Instruct"  # Strong small model for math/reasoning (2026)
+    model_name: str = "HuggingFaceTB/SmolLM3-3B"  # Strong small model for math/reasoning (2026)
     load_in_4bit: bool = True
     max_new_tokens: int = 1800
     temperature: float = 0.55
