@@ -1,0 +1,66 @@
+name: Generate 100k Science-Heavy Dataset (Local LLM)
+
+on:
+  workflow_dispatch:  # Trigger manually from GitHub UI (recommended for long runs)
+    inputs:
+      target_samples:
+        description: 'Target samples (default 100000)'
+        required: false
+        default: '100000'
+
+  push:
+    branches: [ main ]
+    paths: [ 'generate_science_dataset.py' ]  # Re-run only if script changes
+
+jobs:
+  generate:
+    runs-on: [self-hosted, gpu]   # IMPORTANT: Use your self-hosted GPU runner with CUDA + sufficient VRAM
+    # If you have multiple labels: runs-on: [self-hosted, linux, x64, gpu, nvidia]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check GPU & CUDA (streaming debug)
+        run: |
+          nvidia-smi
+          python -c "
+          import torch
+          print('CUDA available:', torch.cuda.is_available())
+          print('Device count:', torch.cuda.device_count())
+          if torch.cuda.is_available():
+              print('GPU Name:', torch.cuda.get_device_name(0))
+              print('VRAM:', round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2), 'GB')
+          "
+
+      - name: Run full 100k dataset generation (real-time streaming output)
+        run: python generate_science_dataset.py
+        env:
+          TARGET_SAMPLES: ${{ github.event.inputs.target_samples || 100000 }}
+
+      - name: Upload final dataset as artifact (for download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: science-heavy-dataset
+          path: dataset_output/*.jsonl
+          retention-days: 30
+
+      - name: Commit and push generated dataset back to repo (optional - for persistence)
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add dataset_output/*.jsonl
+          git commit -m "Add generated science-heavy dataset (100k samples) - $(date)" || echo "No changes to commit"
+          git push
+        continue-on-error: true
